@@ -1,0 +1,80 @@
+# The always-on server: app, worker, PostgreSQL, Redis, and Caddy for HTTPS.
+# Needs a .env next to it (see .env.example) that also sets DOMAIN and POSTGRES_PASSWORD.
+#   docker compose -f docker-compose.prod.yml up -d --build
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: droppilot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: droppilot
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U droppilot"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
+    image: droppilot
+    restart: unless-stopped
+    command: sh -c "npx prisma migrate deploy && npm run db:seed && npm run start"
+    env_file: .env
+    environment: &container-env
+      DATABASE_URL: postgresql://droppilot:${POSTGRES_PASSWORD}@postgres:5432/droppilot
+      REDIS_URL: redis://redis:6379
+      IMAGE_CACHE_DIR: /app/storage/images
+    volumes: &data-volumes
+      - images:/app/storage/images
+    depends_on: &backing-services
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    image: droppilot
+    restart: unless-stopped
+    command: npm run worker
+    env_file: .env
+    environment: *container-env
+    volumes: *data-volumes
+    depends_on:
+      <<: *backing-services
+      app:
+        condition: service_started
+
+  # Only Caddy is reachable from the internet; it gets and renews the HTTPS certificate by itself.
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    command: caddy reverse-proxy --from ${DOMAIN:?set DOMAIN in .env} --to app:3000
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - caddydata:/data
+    depends_on:
+      - app
+
+volumes:
+  pgdata:
+  redisdata:
+  images:
+  caddydata:

@@ -1,0 +1,445 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Marketplace {
+  EBAY
+  AMAZON
+}
+
+enum ProductStatus {
+  DISCOVERED
+  MATCHING
+  ELIGIBLE
+  REJECTED
+  ARCHIVED
+}
+
+enum MatchStatus {
+  CONFIRMED
+  REVIEW
+  REJECTED
+}
+
+enum DecidedBy {
+  AUTO
+  USER
+}
+
+enum ListingStatus {
+  DRAFT
+  PENDING_APPROVAL
+  ACTIVE
+  PAUSED
+  ENDED
+  ERROR
+}
+
+enum PauseReason {
+  OUT_OF_STOCK
+  BELOW_FLOOR
+  HOLIDAY_CUTOFF
+  DELIVERY_PROMISE
+  ACCOUNT_HEALTH
+  MANUAL
+}
+
+enum RepricerStrategy {
+  CHEAPEST
+  MATCH
+  SLIGHTLY_BELOW
+  PREMIUM
+}
+
+enum PriceChangeReason {
+  INITIAL
+  REPRICE
+  SUPPLIER_COST
+  SEASONAL
+  FLOOR
+  MANUAL
+}
+
+enum OrderStatus {
+  NEW
+  NEEDS_DECISION
+  ORDERED
+  SHIPPED
+  DELIVERED
+  CANCELLED
+  FAILED
+}
+
+enum SupplierOrderStatus {
+  PENDING
+  PLACED
+  SHIPPED
+  DELIVERED
+  FAILED
+}
+
+enum AlertSeverity {
+  INFO
+  WARNING
+  CRITICAL
+}
+
+enum JobStatus {
+  RUNNING
+  SUCCEEDED
+  FAILED
+}
+
+model Supplier {
+  id                    String    @id @default(cuid())
+  code                  String    @unique // "cj", later "aliexpress-ds", "spocket"
+  name                  String
+  isDropshipSupplier    Boolean   @default(true) // compliance guard refuses false
+  supportsBlindShipping Boolean   @default(false)
+  products              Product[]
+  createdAt             DateTime  @default(now())
+}
+
+model Product {
+  id               String           @id @default(cuid())
+  supplierId       String
+  supplier         Supplier         @relation(fields: [supplierId], references: [id])
+  externalId       String
+  title            String
+  description      String           @db.Text
+  category         String?
+  isPersonalized   Boolean          @default(false)
+  supplierTrending Boolean          @default(false) // appeared in the supplier's trending search
+  galleryUrls      String[] // every product photo the supplier has, main first; `images` holds the first ones, cached for matching
+  detailImageUrls  String[] // pictures from the supplier's description, shown in our listing description
+  specs            Json? // extracted specs, Zod-validated
+  status           ProductStatus    @default(DISCOVERED)
+  variants         ProductVariant[]
+  images           ProductImage[]
+  trendSnapshots   TrendSnapshot[]
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+
+  @@unique([supplierId, externalId])
+}
+
+model ProductVariant {
+  id               String           @id @default(cuid())
+  productId        String
+  product          Product          @relation(fields: [productId], references: [id], onDelete: Cascade)
+  externalId       String
+  sku              String
+  attributes       Json // color, size, withBox, …
+  specs            Json? // extracted specs for this variant, Zod-validated
+  costCents        Int
+  shippingCents    Int
+  currency         String           @default("USD")
+  warehouse        String // "US", "EU", "CN"
+  stock            Int              @default(0)
+  processingDays   Int
+  deliveryDaysMin  Int
+  deliveryDaysMax  Int
+  isUnique         Boolean          @default(false) // zero confirmed competitors
+  repricerStrategy RepricerStrategy @default(SLIGHTLY_BELOW)
+  lastSyncedAt     DateTime?
+  images           ProductImage[]
+  matches          ProductMatch[]
+  demandSnapshots  DemandSnapshot[]
+  listings         Listing[]
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+
+  @@unique([productId, externalId])
+}
+
+model ProductImage {
+  id        String          @id @default(cuid())
+  productId String
+  product   Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+  variantId String?
+  variant   ProductVariant? @relation(fields: [variantId], references: [id])
+  url       String // supplier URL
+  localPath String? // cached copy
+  position  Int
+  pHash     String?
+  embedding Float[]
+
+  @@unique([productId, position])
+}
+
+model CompetitorListing {
+  id             String            @id @default(cuid())
+  marketplace    Marketplace
+  externalId     String // eBay itemId / ASIN
+  title          String
+  description    String?           @db.Text
+  url            String?
+  priceCents     Int
+  shippingCents  Int               @default(0)
+  currency       String            @default("USD")
+  deliveryDays   Int?
+  sellerRating   Float?
+  soldCount      Int?
+  itemSpecifics  Json?
+  extractedSpecs Json?
+  images         CompetitorImage[]
+  matches        ProductMatch[]
+  firstSeenAt    DateTime          @default(now())
+  lastSeenAt     DateTime          @default(now())
+
+  @@unique([marketplace, externalId])
+}
+
+model CompetitorImage {
+  id        String            @id @default(cuid())
+  listingId String
+  listing   CompetitorListing @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  url       String
+  localPath String? // cached copy
+  position  Int
+  pHash     String?
+  embedding Float[]
+
+  @@unique([listingId, position])
+}
+
+model ProductMatch {
+  id                  String            @id @default(cuid())
+  variantId           String
+  variant             ProductVariant    @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  competitorListingId String
+  competitorListing   CompetitorListing @relation(fields: [competitorListingId], references: [id], onDelete: Cascade)
+  imageScore          Float
+  matchedImageCount   Int
+  specScore           Float
+  hardRuleFailures    String[] // e.g. ["personalization"], ["material"]
+  visionVerdict       Json? // {same, confidence, differences[]}
+  finalScore          Float
+  status              MatchStatus
+  decidedBy           DecidedBy         @default(AUTO)
+  decidedAt           DateTime?
+  lastEvaluatedAt     DateTime          @default(now())
+  createdAt           DateTime          @default(now())
+
+  @@unique([variantId, competitorListingId])
+  @@index([status])
+}
+
+model DemandSnapshot {
+  id                    String         @id @default(cuid())
+  variantId             String
+  variant               ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  score                 Float // 0–100
+  components            Json // velocity, trend, competition, margin, delivery
+  competitorCount       Int
+  lowestCompetitorCents Int?
+  salesRank             Int?
+  soldLast30d           Int?
+  capturedAt            DateTime       @default(now())
+
+  @@index([variantId, capturedAt])
+}
+
+model TrendSnapshot {
+  id             String   @id @default(cuid())
+  productId      String?
+  product        Product? @relation(fields: [productId], references: [id], onDelete: Cascade)
+  keyword        String
+  geo            String   @default("US")
+  direction      String // rising | flat | falling
+  peakMonth      Int?
+  series         Json // relative interest 0–100, never sales
+  relatedQueries Json?
+  capturedAt     DateTime @default(now())
+
+  @@index([keyword, capturedAt])
+}
+
+model Holiday {
+  id                  String    @id @default(cuid())
+  code                String    @unique // "valentines", "mothers-day", …
+  name                String
+  country             String    @default("US")
+  dateRule            String // "02-14" or "nth:5:2:0" (2nd Sunday of May)
+  keywords            String[]
+  categories          String[]
+  listStartDaysBefore Int       @default(60)
+  endAfterDays        Int       @default(2)
+  retargetToCode      String? // e.g. valentines → mothers-day
+  autoListTopN        Int       @default(5)
+  enabled             Boolean   @default(true)
+  listings            Listing[]
+}
+
+model Listing {
+  id             String         @id @default(cuid())
+  variantId      String
+  variant        ProductVariant @relation(fields: [variantId], references: [id])
+  marketplace    Marketplace
+  externalId     String? // null while draft
+  groupKey       String? // set when this listing is one option of a marketplace listing with variations; the options share it and the externalId
+  sku            String
+  title          String
+  description    String         @db.Text
+  priceCents     Int
+  floorCents     Int
+  quantity       Int            @default(0)
+  status         ListingStatus  @default(DRAFT)
+  pauseReason    PauseReason?
+  holidayId      String?
+  holiday        Holiday?       @relation(fields: [holidayId], references: [id])
+  cutoffDate     DateTime? // stop-selling date for the holiday
+  isTopSeller    Boolean        @default(false)
+  lastRepricedAt DateTime?
+  priceHistory   PriceHistory[]
+  orderItems     OrderItem[]
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  @@unique([marketplace, sku])
+  @@index([status])
+  @@index([marketplace, groupKey])
+}
+
+model PriceHistory {
+  id         String            @id @default(cuid())
+  listingId  String
+  listing    Listing           @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  priceCents Int
+  floorCents Int
+  costCents  Int
+  reason     PriceChangeReason
+  createdAt  DateTime          @default(now())
+
+  @@index([listingId, createdAt])
+}
+
+model Order {
+  id              String          @id @default(cuid())
+  marketplace     Marketplace
+  externalId      String
+  status          OrderStatus     @default(NEW)
+  buyerName       String
+  buyerUsername   String? // the buyer's marketplace account name; lets us erase their data when eBay reports the account closed
+  shippingAddress Json // encrypted with ENCRYPTION_KEY
+  totalCents      Int
+  currency        String          @default("USD")
+  orderedAt       DateTime
+  shipByDate      DateTime?
+  items           OrderItem[]
+  supplierOrders  SupplierOrder[]
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  @@unique([marketplace, externalId])
+  @@index([status])
+  @@index([marketplace, buyerUsername])
+}
+
+model OrderItem {
+  id             String  @id @default(cuid())
+  orderId        String
+  order          Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  listingId      String
+  listing        Listing @relation(fields: [listingId], references: [id])
+  externalLineId String
+  quantity       Int
+  priceCents     Int
+
+  @@unique([orderId, externalLineId])
+}
+
+model SupplierOrder {
+  id                  String              @id @default(cuid())
+  orderId             String
+  order               Order               @relation(fields: [orderId], references: [id])
+  externalId          String? // supplier order ID
+  idempotencyKey      String              @unique // prevents double-ordering on retry
+  lineIds             String[] // OrderItem ids shipped in this supplier order
+  status              SupplierOrderStatus @default(PENDING)
+  costCents           Int
+  shippingCents       Int
+  expectedProfitCents Int
+  blindShipping       Boolean
+  trackingNumber      String?
+  carrier             String?
+  trackingUploadedAt  DateTime?
+  failureReason       String?
+  trackingEvents      TrackingEvent[]
+  createdAt           DateTime            @default(now())
+  updatedAt           DateTime            @updatedAt
+}
+
+model TrackingEvent {
+  id              String        @id @default(cuid())
+  supplierOrderId String
+  supplierOrder   SupplierOrder @relation(fields: [supplierOrderId], references: [id], onDelete: Cascade)
+  status          String
+  description     String?
+  location        String?
+  occurredAt      DateTime
+
+  @@unique([supplierOrderId, status, occurredAt])
+}
+
+model AccountHealth {
+  id                String      @id @default(cuid())
+  marketplace       Marketplace
+  lateShipmentRate  Float?
+  cancellationRate  Float?
+  validTrackingRate Float?
+  defectRate        Float?
+  returnRate        Float?
+  newListingsPaused Boolean     @default(false)
+  capturedAt        DateTime    @default(now())
+
+  @@index([marketplace, capturedAt])
+}
+
+model Alert {
+  id         String        @id @default(cuid())
+  severity   AlertSeverity
+  type       String // "order.price_jump", "health.late_rate", …
+  message    String
+  context    Json?
+  orderId    String?
+  resolvedAt DateTime?
+  createdAt  DateTime      @default(now())
+
+  @@index([resolvedAt])
+}
+
+model JobLog {
+  id         String    @id @default(cuid())
+  queue      String
+  jobName    String
+  jobKey     String? // idempotency key
+  status     JobStatus
+  error      String?   @db.Text
+  result     Json?
+  startedAt  DateTime  @default(now())
+  finishedAt DateTime?
+
+  @@index([queue, startedAt])
+}
+
+model Settings {
+  id        Int      @id @default(1) // singleton row
+  data      Json // Zod-validated: fees, margins, buffers, thresholds, limits
+  updatedAt DateTime @updatedAt
+}
+
+model ApiCredential {
+  id         String    @id @default(cuid())
+  provider   String    @unique // "ebay", "spapi", "cj", …
+  ciphertext String    @db.Text // AES-256-GCM
+  iv         String
+  authTag    String
+  expiresAt  DateTime?
+  updatedAt  DateTime  @updatedAt
+}

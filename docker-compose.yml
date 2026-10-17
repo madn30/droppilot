@@ -1,0 +1,60 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: droppilot
+      POSTGRES_PASSWORD: droppilot
+      POSTGRES_DB: droppilot
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U droppilot"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build: .
+    command: sh -c "npx prisma migrate deploy && npm run db:seed && npm run dev"
+    env_file: .env
+    environment: &container-env
+      DATABASE_URL: postgresql://droppilot:droppilot@postgres:5432/droppilot
+      REDIS_URL: redis://redis:6379
+    ports:
+      - "${APP_PORT:-3000}:3000"
+    volumes: &source-volumes
+      - ./src:/app/src
+      - ./prisma:/app/prisma
+      - images:/app/storage/images
+    depends_on: &backing-services
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: npm run worker
+    env_file: .env
+    environment: *container-env
+    volumes: *source-volumes
+    depends_on:
+      <<: *backing-services
+      app:
+        condition: service_started
+
+volumes:
+  pgdata:
+  images:
